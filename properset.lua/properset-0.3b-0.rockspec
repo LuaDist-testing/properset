@@ -1,17 +1,9 @@
--- This file was automatically generated for the LuaDist project.
-
 package = "properset"
-version = "0.1-0"
--- LuaDist source
+version = '0.3b-0'
 source = {
-  tag = "0.1-0",
-  url = "git://github.com/LuaDist-testing/properset.git"
+   url = "git://github.com/odkr/properset.lua",
+   tag = 'v0.3b-0'
 }
--- Original source
--- source = {
---    url = "git://github.com/odkr/properset.lua",
---    tag = "v0.1-0"
--- }
 description = {
    summary = [[Allows to properly handle sets that contain
    objects, tables, or other sets, sports a rich and sane interface, and is
@@ -55,7 +47,7 @@ description = {
        > set = Set{a, b}
        > for k in pairs(set) do print (k) end
        table: 0x7ffd87d04680
-       table: 0x7ffd87f01100
+       table: 0x7ffd87f0.200
 
    `a` and `b` are, for all intents and purposes, equal, so they should not
    *both* be members of the same set. However, because they are tables, all
@@ -72,7 +64,7 @@ description = {
        > set = Set{a, b}
        > for k in pairs(set) do print (k) end
        table: 0x7ffd87d04680
-       table: 0x7ffd87f01100
+       table: 0x7ffd87f0.200
 
    When a table is used as a key in another table, no comparison takes place.
    So defining what it means to be equal is pointless.

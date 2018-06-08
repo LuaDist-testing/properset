@@ -1,9 +1,9 @@
---- Handle complex sets.
+--- Handles complex sets.
 --
 -- @usage
 --      > properset = require 'properset'
 --      > Set = properset.Set
---      > a = Set:new{1, 2, 2, 3, 3, 3}
+--      > a = Set{1, 2, 2, 3, 3, 3}
 --      > a
 --      {1, 2, 3}
 --
@@ -11,7 +11,8 @@
 -- @author Odin Kroeger
 -- @copyright 2018 Odin Kroeger
 -- @license MIT
--- @release 0.1-0
+-- @release 0.3b-0
+
 
 -- Boilerplate
 -- ===========
@@ -20,6 +21,7 @@ local properset = {}
 
 local assert = assert
 local error = error
+local pcall = pcall
 local table = table
 local next = next
 local ipairs = ipairs
@@ -27,19 +29,65 @@ local pairs = pairs
 local getmetatable = getmetatable
 local setmetatable = setmetatable
 local string = string
+local tonumber = tonumber
 local tostring = tostring
 local type = type
+local rawequal = rawequal
+local rawset = rawset
 
+local upvalueid = debug.upvalueid
+local huge = math.huge
+
+
+-- DEBUG
 local print = print
+
 
 local _ENV = properset
 
 
--- Constants
--- =========
+-- Private constants
+-- =================
 
--- Format for error messages if a value isn't a set.
-local NOTASETERR = "%s: is not a set."
+-- Error message shown on attempts to change a `Set`.
+local SETMODERR = "sets can only be modified by 'add', 'remove' and 'clear'."
+
+-- Format for error shown if a value isn't a set.
+local NOTASETERR = 'expected a Set, got a %s.'
+
+-- Format for error shown if `add` or `remove` are invoked for `FrozenSet`.
+local MODFROZENERR = 'set is frozen.'
+
+
+-- Private utility functions
+-- =========================
+
+--- Adds an object to a set.
+--
+-- Neither checks whether the object is a member already,
+-- nor whether adding would make the set a a member of itself!
+--
+-- @tparam Set set The set to add to.
+-- @param obj The object to add.
+-- @tparam[opt] number n The index *after* which to store `obj`,
+--  if it's a table.
+--
+-- @return number If `obj` is a table, index at which it was stored;
+--  otherwise, `nil`.
+local function unchkdadd (set, obj, n)
+    local vt = set._val
+    local vs = vt.mem
+    local ts = set._tab
+    n = n or #ts
+    if type(obj) == 'table' then
+        n = n + 1
+        ts[n] = obj
+        return n
+    else
+        vs[obj] = true
+        vt.len = vt.len + 1
+    end
+end
 
 
 -- Sets as types
@@ -49,7 +97,8 @@ local NOTASETERR = "%s: is not a set."
 -- ------------
 
 ---
--- Sets can only be modified using `add` and `delete`.
+-- Sets contain every item at most once.
+-- They can only be modified using `add` and `remove`.
 -- And set members are (mostly) immutable.
 --
 -- You should *not* attempt to modify set members.
@@ -59,179 +108,167 @@ local NOTASETERR = "%s: is not a set."
 -- @type Set
 
 Set = {}
-Set.__index = Set
+Set.mt = {}
+Set.mt.__index = Set
 
 
 --- Creates a new instance of a prototype, typically `Set`.
 --
--- @tparam[opt] table members Set members.
+-- @tparam[opt] table elems Members for the new set.
 --
--- @return An instance of the given `prototype` for sets,
---  populated with `members`, if any were given.
+-- @return An instance of the given prototype for sets,
+--  populated with `elems`, if any were given.
 --
 -- @usage
 --      > Set:new{1, 2, 3}
 --      {1, 2, 3}
-function Set:new (members)
+--      > Set{1, 2, 3}
+--      {1, 2, 3}
+function Set:new (elems)
     self = self or Set
-    local set = {_members={}}
-    setmetatable(set, self)
-    if members then set:add(members) end
+    local set = {_val = {len = 0, mem = {}}, _tab = {}, _meta = {}}
+    setmetatable(set, self.mt)
+    if elems then set:add(elems) end
     return set
 end
 
+-- Convenience.
+setmetatable(Set, {__call = Set.new})
 
----
--- Blocks accidential modifications of a set or its members.
+
+--- Returns the ID of the set.
 --
--- @raise An error whenever it's invoked.
-function Set:__newindex()
-    error("sets can only be modified using 'add' and 'delete'.", 2)
-end
-
-
--- Cardinality
--- -----------
-
---- The number of elements in the set.
+-- @tparam[opt=0] number flags If `ASNUM` is set, returns the ID as a number. 
 --
--- @treturn number Number of elements in the set.
+-- @treturn number The ID.
 --
 -- @usage
---      > a = Set:new{1, 2, 3}
---      > #a
---      3
-function Set:__len ()
-    return #self._members
-end
-
-
--- Iterting over sets
--- ------------------
-
---- Iterates over all members of the set.
---
--- @treturn function A function that returns a member of the set.
---
--- @usage
---      > a = Set:new{1, 2, 3}
---      > for v in a:members() do print(v) end
---      1
---      2
---      3
-function Set:members ()
-    local m = self._members
-    local i = 0
-    local n = #m
-    return function ()
-        i = i + 1
-        if i <= n then return m[i] end
+--      > a = Set()
+--      > a:id()
+--      Set: 0x7f8a555d4df0
+--      > a:id(properset.ASNUM)
+--      140232114392560
+function Set:id (flags)
+    flags = flags or 0
+    local m = self._meta
+    if m.id == nil then
+        -- Needed to make `upvalueid` return this method's `self`,
+        -- rather than the caller's.
+        local s = self
+        local r = upvalueid(function () return s end, 1)
+        m.id = tonumber(tostring(r):match(': (0x%x+)'))
+    end
+    if flags & ASNUM == ASNUM then return m.id
+                              else return string.format('Set: 0x%x', m.id)
     end
 end
 
-
---- Iterates over the set as if it were a list.
---
--- @usage
---      > a = Set:new{'a', 'b', 'c'}
---      > for i, v in ipairs(a) do print(i, v) end
---      1       a
---      2       b
---      3       c
-function Set:__ipairs ()
-    return nth_member, self, 0
-end
-
-
---- Iterates over the set as if it were a table.
---
--- @usage
---      > a = Set:new{'a', 'b', 'c'}
---      > for k, v in pairs(a) do print(k, v) end
---      1       a
---      2       b
---      3       c
-function Set:__pairs ()
-    return next_member, self, nil
-end
-
-
--- Manipulating sets
--- -----------------
 
 --- Adds elements to a set.
 --
--- @tparam table elements A list of elements to be added.
+-- Don't add members to a set while you're iterating over it.
+--
+-- @tparam table elems A list of elements to be added.
+--
+-- @raise Raises an error if you try to add a set to itself.
 --
 -- @usage
---      > a = Set:new{1}
+--      > a = Set{1}
 --      > a:add{2}
 --      > a
 --      {1, 2}
 --      > a:add{2}
 --      > a
 --      {1, 2}
-function Set:add (elements)
-    for _, v in ipairs(elements) do
-        if not self:has_member(v) then
-            table.insert(self._members, v)
+function Set:add (elems)
+    local uad = unchkdadd
+    local has = self.has
+    local n
+    -- This must be `pairs` to handle sparse arrays correctly.
+    for _, v in pairs(elems) do
+        if not has(self, v) then
+            -- @todo Test if it's faster without passing n.
+            n = uad(self, v, n) or n
         end
     end
 end
 
 
---- Deletes elements from a set.
+--- Deletes members from a set.
 --
--- Don't delete members of a set while you're iterating over it.
+-- Don't remove members from a set while you're iterating over it.
 --
--- That is, don't try something like this:
---
---      a = Set:new{1, 2}
---      b = Set:new{2, 4}
---      for v in a:members() do
---          for w in b:members() do
---              if v == w then
---                  a:delete{v}
---              end
---          end
---      end
---
---
--- @tparam table members A list of elements to be deleted.
+-- @tparam table mems A list of members to be removed.
 --
 -- @usage
---      > a = Set:new{1, 2, 3}
---      > a:delete{2, 3}
+--      > a = Set{1, 2, 3}
+--      > a:remove{2, 3}
 --      > a
 --      {1}
-function Set:delete (members)
-    for i = #self._members, 1, -1 do
-        for _, v in ipairs(members) do
-            if self._members[i] == v then
-                table.remove(self._members, i)
-                break
+function Set:remove (mems)
+    local rem = table.remove
+    local vt = self._val
+    local vs = vt.mem
+    local ts = self._tab
+    for _, v in pairs(mems) do
+        if type(v) == 'table' then
+            for i = #ts, 1, -1 do
+                if ts[i] == v then
+                    -- `ts[i] = nil` causes a weird bug.
+                    rem(ts, i)
+                    break
+                end
             end
+        else
+            vs[v] = nil
+            vt.len = vt.len - 1
         end
     end
 end
 
 
--- Boolean relations
--- -----------------
+--- Removes all members from the set.
+--
+-- Don't remove members from a set while you're iterating over it.
+--
+-- @usage
+--      > a = Set{1, 2}
+--      > a:clear()
+--      > a
+--      {}
+function Set:clear ()
+    self._val.mem = {}
+    self._val.len = 0
+    self._tab = {}
+end
+
 
 --- Tests whether the set is empty.
 --
 -- @treturn boolean Whether the set is empty.
 --
 -- @usage
---      > a = Set:new()
---      > a:is_empty()
+--      > a = Set()
+--      > a:isempty()
 --      true
---      > b = Set:new{1}
---      > b:is_empty()
+--      > b = Set{1}
+--      > b:isempty()
 --      false
-function Set:is_empty ()
+function Set:isempty ()
     return #self == 0
+end
+
+
+--- Tests whether the set is frozen.
+--
+-- @treturn boolean `false`.
+--
+-- @usage
+--      > a = Set()
+--      > a:isfrozen()
+--      false
+function Set:isfrozen ()
+    return false
 end
 
 
@@ -242,343 +279,147 @@ end
 -- @treturn boolean Whether an object is a member of the set.
 --
 -- @usage
---      > a = Set:new{1}
---      > a:has_member(1)
+--      > a = Set{1}
+--      > a:has(1)
 --      true
---      > a:has_member(0)
+--      > a:has(0)
 --      false
-function Set:has_member (obj)
-    for v in self:members() do
-        if v == obj then return true end
+function Set:has (obj, s)
+    if type(obj) == 'table' then
+        if s and s[obj] then return true end
+        local ts = self._tab
+        if isset(obj) then
+            if s then s[obj] = true else s = {[obj] = true} end
+            local eq = getmetatable(obj).__eq
+            for i = 1, #ts do if eq(obj, ts[i], s) then return true end end
+        else
+            for i = 1, #ts do if ts[i] == obj then return true end end
+        end
+        return false
+    else
+        return self._val.mem[obj] or false
     end
-    return false
 end
 
 
---- Tests whether the set is a subset of another set.
+--- Iterates over all members of the set.
 --
--- @tparam Set other The other set.
---
--- @treturn boolean Whether the set is a subset of another set.
---
--- @raise Raises an error of `other` is not a `Set`
---  (or another implementation of its protocol).
+-- @treturn function A function that returns a member of the set.
 --
 -- @usage
---      > a = Set:new{1, 2}
---      > b = Set:new{1}
---      > c = Set:new{3}
---      > b <= a
---      true
---      > c <= a
---      false
-function Set:__le (other)
-    assert_set(other, string.format(NOTASETERR, "'other'"))
-    for i in self:members() do
-        if not other:has_member(i) then return false end
+--      > a = Set{1, 2, 3}
+--      > for v in a:mems() do print(v) end
+--      1
+--      2
+--      3
+function Set:mems ()
+    local vs = self._val.mem
+    local ts = self._tab
+    local k = nil
+    local i = 0
+    return function ()
+        if k ~= nil or i == 0 then
+            k, _ = next(vs, k)
+            if k ~= nil then return k end
+        end
+        i = i + 1
+        return ts[i]
     end
-    return true
-end
-
-
---- Tests whether the set is a superset of another set.
---
--- @tparam Set other The other set.
---
--- @treturn boolean Whether the set is a superset of another set.
---
--- @raise Raises an error of `other` is not a `Set`
---  (or another implementation of its protocol).
---
--- @usage
---      > a = Set:new{1, 2}
---      > b = Set:new{1}
---      > c = Set:new{3}
---      > a >= b
---      true
---      > a >= c
---      false
-function Set:__ge (other)
-    assert_set(other, string.format(NOTASETERR, "'other'"))
-    return other <= self
-end
-
-
---- Tests whether the set is a strict subset of another set.
---
--- @tparam Set other The other set.
---
--- @treturn boolean Whether the set is a strict subset of another set.
---
--- @raise Raises an error of `other` is not a `Set`
---  (or another implementation of its protocol).
---
--- @usage
---      > a = Set:new{1, 2}
---      > b = Set:new{1}
---      > c = Set:new{3}
---      > a < a
---      false
---      > a <= a
---      true
---      > b < a
---      true
---      > c < a
---      false
-function Set:__lt (other)
-    assert_set(other, string.format(NOTASETERR, "'other'"))
-    if #self < #other then return self <= other end
-    return false
-end
-
-
---- Tests whether the set is a strict superset of another set.
---
--- @tparam Set other The other set.
---
--- @treturn boolean Whether the set is a strict superset of another set.
---
--- @raise Raises an error of `other` is not a `Set`
---  (or another implementation of its protocol).
---
--- @usage
---      > a = Set:new{1, 2}
---      > b = Set:new{1}
---      > c = Set:new{3}
---      > a > a
---      false
---      > a >= a
---      true
---      > a > b
---      true
---      > a > c
---      false
-function Set:__gt (other)
-    assert_set(other, string.format(NOTASETERR, "'other'"))
-    return other < self
-end
-
-
---- Tests whether the set is equal to another set.
---
--- @tparam Set other The other set.
---
--- @treturn boolean Whether the set is equal to another set.
---
--- @raise Raises an error of `other` is not a `Set`
---  (or another implementation of its protocol).
---
--- @usage
---      > a = Set:new{1}
---      > b = Set:new{1}
---      > c = Set:new{2}
---      > a == b
---      true
---      > a ~= b
---      false
---      > a == c
---      false
---      > a ~= c
---      true
-function Set:__eq (other)
-    if not is_set(other) then return false end
-    if #self == #other then return self <= other end
-    return false
-end
-
-
---- Tests whether the set is disjoint from another set.
---
--- @tparam Set other The other set.
---
--- @treturn boolean Whether the two sets are disjoint.
---
--- @raise Raises an error of `other` is not a `Set`
---  (or another implementation of its protocol).
---
--- @usage
---      > a = Set:new{1}
---      > b = Set:new{1, 2}
---      > c = Set:new{3}
---      > a:is_disjoint_from(b)
---      false
---      > a:is_disjoint_from(c)
---      true
-function Set:is_disjoint_from (other)
-    assert_set(other, string.format(NOTASETERR, "'other'"))
-    return are_disjoint{self, other}
-end
-
-
--- Set arithmetics
--- ---------------
-
---- The complement of the sets and another set.
---
--- `complement(a, b)` and `a - b` are equivalent.
---
--- @tparam Set other The other set.
---
--- @treturn Set The complement of the two sets.
---
--- @raise Raises an error of `other` is not a `Set`
---  (or another implementation of its protocol).
---
--- @usage
---      > a = Set:new{1, 2}
---      > b = Set:new{2}
---      > a - b
---      {1}
-function Set:__sub (other)
-    assert_set(other, string.format(NOTASETERR, "'other'"))
-    return complement(self, other)
-end
-
-
---- The union of the set and another set.
---
--- `a:union(b)` and `a + b` are equivalent.
---
--- @tparam Set other The other set.
---
--- @treturn Set The union of the two sets.
---
--- @raise Raises an error of `other` is not a `Set`
---  (or another implementation of its protocol).
---
--- @usage
---      > a = Set:new{1}
---      > b = Set:new{2}
---      > a + b
---      {1, 2}
-function Set:__add (other)
-    assert_set(other, string.format(NOTASETERR, "'other'"))
-    return union{self, other}
-end
-
-
---- The intersection of the set with another set.
---
--- @tparam Set other Another set to intersect the set with.
---
--- @treturn Set The intersection of the two sets.
---
--- @raise Raises an error of `other` is not a `Set`
---  (or another implementation of its protocol).
---
--- @usage
---      > a = Set:new{1}
---      > b = Set:new{1,2}
---      > c = Set:new{2}
---      > a:intersection(b)
---      {1}
---      > b:intersection(c)
---      {2}
---      > a:intersection(c)
---      {}
-function Set:intersection (other)
-    assert_set(other, string.format(NOTASETERR, "'other'"))
-    return intersection {self, other}
-end
-
-
---- The symmetric difference between the set and another set.
---
--- @tparam Set other The other set.
---
--- @treturn Set The symmetric difference of the two sets.
---
--- @raise Raises an error of `other` is not a `Set`
---  (or another implementation of its protocol).
---
--- @usage
---      > a = Set:new{1, 2}
---      > b = Set:new{1, 3}
---      > a:difference(b)
---      {2, 3}
-function Set:difference (other)
-    assert_set(other, string.format(NOTASETERR, "'other'"))
-    return difference {self, other}
 end
 
 
 --- The set's power set.
 --
--- Note: Calculating the power set of a set with five members
--- takes about 0.01s, calculating the power for n = 6 takes about
--- 0.1s, n = 7 takes about 0.5s, n = 8 about 5s, n = 9 about 50s, ...
--- (all on a modern-ish Laptop CPU, without LuaJIT). So be careful
--- what you're trying to calculate.
+-- Calculating a power set runs in exponential time, namely, *O*(2^*n*).
+-- Average times needed to calculate the power set of a set with *n* members
+-- (on an 1,6 GHz Intel Core i5 with Lua 5.3.4):
+--
+-- * n = 8: <0.01s
+-- * n = 9: 0.01s
+-- * n = 10: 0.02s,
+-- * n = 11: 0.03s
+-- * n = 12: 0.06s
+-- * n = 13: 0.12s
+-- * n = 14: 0.28s
+-- * n = 15: 0.51s
+-- * n = 16: 1s
 --
 -- @treturn Set(Set,...) The set's power set.
 --
 -- @usage
---      > a = Set:new{0, 1}
+--      > a = Set{0, 1}
 --      > a:power()
 --      {{0, 1}, {1}, {}, {0}}
 function Set:power ()
-    local res = Set:new{self}
-    for i in self:members() do
-        local subset = self - Set:new{i}
-        for j in subset:power():members() do
-            res:add{j}
+    local uad = unchkdadd
+    local cop = copy
+    local res = Set:new()
+    local rt = res._tab
+    local n = 1
+    rt[n] = Set:new()
+    for v in self:mems() do
+        for i = 1, n do
+            local s = cop(rt[i])
+            uad(s, v)
+            n = n + 1
+            rt[n] = s
         end
     end
     return res
 end
 
 
--- Sets of sets
--- ------------
-
---- The set's rank.
---
--- @treturn number The set's rank.
---
--- @see rank
-function Set:rank ()
-    return rank(self)
-end
-
-
 --- All members of rank *n*.
 --
--- `a:flatten()` and `a:of_rankn(0, true)` are equivalent.
+-- `a:flattened()` and `a:ofrank(0, propertyset.RECURSIVE)` are equivalent.
 --
 -- @tparam number n The rank.
--- @tparam boolean desc Whether to descend into members that are sets, too.
+-- @tparam[opt=0] number flags If `RECURSIVE` is set, then searches members
+--   of the set that are sets, members of those sets that are sets, ..., too.
 --
 -- @treturn Set The members of rank *n*.
 --
 -- @usage
---      > a = Set:new{1, Set:new{2, Set:new{3, 4}, Set:new{5}}, Set:new{6}}
+--      > a = Set{1, Set{2, Set{3, 4}, Set{5}}, Set{6}}
 --      > a
 --      {1, {2, {3, 4}, {5}}, {6}}
---      > a:of_rankn(0)
+--      > a:ofrank(0)
 --      {1}
---      > a:of_rankn(1)
+--      > a:ofrank(1)
 --      {{6}}
---      > a:of_rankn(2)
+--      > a:ofrank(2)
 --      {{2, {3, 4}, {5}}}
---      > a:of_rankn(3)
+--      > a:ofrank(3)
 --      {}
---      > a:of_rankn(0, true)
+--      > a:ofrank(0, true)
 --      {1, 2, 3, 4, 5, 6}
---      > a:of_rankn(1, true)
+--      > a:ofrank(1, true)
 --      {{3, 4}, {5}, {6}}
---      > a:of_rankn(2, true)
+--      > a:ofrank(2, true)
 --      {{2, {3, 4}, {5}}}
---      > a:of_rankn(3, true)
+--      > a:ofrank(3, true)
 --      {}
 --
 -- @see rank
-function Set:of_rankn (n, desc)
-    if desc == nil then desc = false end
-    if n == 0 and desc then return self:flatten() end
+function Set:ofrank (n, flags, s)
+    flags = flags or 0
+    -- `flattened` is faster than `ofrank`.
+    if n == 0 and flags & RECURSIVE == RECURSIVE then 
+        return self:flattened()
+    end
+    s = s or {}
+    local isset = isset
+    local rank = rank
     local res = Set:new()
-    for v in self:members() do
-        if rank(v) == n then res:add{v} end
-        if desc and is_set(v) then res = res + v:of_rankn(n, desc) end
+    local add = res.add
+    for v in self:mems() do
+        if not s[v] then
+            s[v] = true
+            if rank(v) == n then add(res, {v}) end
+            if flags & RECURSIVE == RECURSIVE and isset(v) then
+                res = res + v:ofrank(n, flags, s)
+            end
+        end
     end
     return res
 end
@@ -598,27 +439,28 @@ end
 -- @raise Raises an error unless `n` > 0.
 --
 -- @usage
---      > a = Set:new{1, Set:new{2, Set:new{3, 4}, Set:new{5}}, Set:new{6}}
+--      > a = Set{1, Set{2, Set{3, 4}, Set{5}}, Set{6}}
 --      > a
 --      {1, {2, {3, 4}, {5}}, {6}}
---      > a:at_leveln(1)
+--      > a:atlevel(1)
 --      {1, {2, {3, 4}, {5}}, {6}}
---      > a:at_leveln(2)
+--      > a:atlevel(2)
 --      {2, {3, 4}, {5}, 6}
---      > a:at_leveln(3)
+--      > a:atlevel(3)
 --      {3, 4, 5}
---      > a:at_leveln(4)
+--      > a:atlevel(4)
 --      {}
-function Set:at_leveln (n)
+function Set:atlevel (n)
     assert(n > 0, "'n' must be greater than 0.")
     if n == 1 then
-        return self:copy()
+        return copy(self)
     else
+        local isset = isset
         local res = Set:new()
-        for v in self:members() do
-            if is_set(v) then
-                local m = v:at_leveln(n-1)
-                res:add(m._members)
+        local add = res.add
+        for v in self:mems() do
+            if isset(v) then
+                add(res, v:atlevel(n - 1))
             end
         end
         return res
@@ -626,57 +468,118 @@ function Set:at_leveln (n)
 end
 
 
--- Convenience methods
--- -------------------
-
---- A string representation of the set.
+--- Maps a function of all values of the set onto another set.
 --
--- `__tostring(a)` and `tostring(a)` are equivalent.
+-- @tparam function func A function to be applied to each member.
 --
--- @treturn string A string that represents the set.
+-- @treturn Set The results of applying `func` to the members of the set.
 --
 -- @usage
---      > a = Set:new{1, Set:new{2, 3}, 4}
---      > tostring(a)
---      {1, {2, 3}, 4}
-function Set:__tostring ()
-    local res = '{'
-    local i = 1
-    for v in self:members() do
-        if i ~= 1 then res = res .. ', ' end
-        i = i + 1
-        if is_set(v) then
-            res = res .. v:__tostring()
-        else
-            res = res .. tostring(v)
-        end
+--      > a = Set{1, 2, 3}
+--      > a:map(function(i) return i + 1 end)
+--      {2, 3, 4}
+function Set:map (func)
+    local add = Set.add
+    local res = Set:new()
+    for v in self:mems() do
+         add(res, {func(v)})
     end
-    res = res .. '}'
+    return res
+end
+
+
+--- Filters members of a set.
+--
+-- @tparam function func A function that defines which members will be selected.
+--
+-- @treturn Set The filtered set.
+--
+-- @usage
+--      > a = Set{1, 2, 3}
+--      > a:filter(function(i) return i % 2 == 0 end)
+--      {2}
+function Set:filter (func)
+    local add = Set.add
+    local res = Set:new()
+    for v in self:mems() do
+         if func(v) then
+             add(res, {v})
+         end
+    end
     return res
 end
 
 
 --- The members of the set as a table.
 --
--- If the set contains other sets, these will be converted to tables, too.
+-- @tparam[opt=0] number flags If `RECURSIVE` is set, then converts members of
+--   the set that are sets, members of those sets that are sets, ..., too.
 --
 -- @treturn table All members of the set.
 --
 -- @usage
---      > a = Set:new{1, 2, 3}
+--      > a = Set{1, 2, 3}
 --      > r = a:totable()
 --      > table.unpack(r)
 --      1       2       3
-function Set:totable ()
+function Set:totable (flags, s)
+    local isset = isset
+    local flags = flags or 0
+    local s = s or {}
     local res = {}
-    for i in self:members() do
-        if is_set(i) then
-            table.insert(res, i:totable())
+    local n = 0
+    s[self] = res
+    for i in self:mems() do
+        n = n + 1
+        if flags & RECURSIVE == RECURSIVE and isset(i) then
+            if s[i] then res[n] = s[i]
+                    else res[n] = i:totable(flags, s)
+            end
         else
-            table.insert(res, i)
+            res[n] = i
         end
     end
     return res
+end
+
+
+--- Unpacks the members of the set.
+--
+-- @tparam[opt=0] number flags If `RECURSIVE` is set, then unpacks not
+--  only this set, but all sets that are members of this set, members of
+--  those sets, and so forth.
+--
+-- @return The members of the given set unpacked.
+--
+-- @usage
+--      > a = Set{1, 2, 3}
+--      > a:unpack()
+--      1       2       3
+function Set:unpack (flags)
+    return table.unpack(self:totable(flags))
+end
+
+
+--- Returns the members of the set sorted.
+--
+-- Keep in mind, sets may be multidimensional.
+--
+-- @tparam[opt] function callable A sorting function.
+-- @tparam[opt=0] number flags If `RECURSIVE` is set, then sorts not
+--  only this set, but all sets that are members of this set, members of
+--  those sets, and so forth.
+--
+-- @treturn table A list of the members of the given set, sorted.
+--
+-- @usage
+--      > a = Set{1, 3, 5, 2, 4, 6, 8, 10, 5, 9, 7}
+--      > r = a:sorted()
+--      > table.concat(r, ', ')
+--      1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+function Set:sorted (callable, flags)
+    local t = self:totable(flags)
+    table.sort(t, callable)
+    return t
 end
 
 
@@ -685,111 +588,433 @@ end
 -- @treturn Set A set with all non-set members of the set and its descendants.
 --
 -- @usage
---      > a = Set:new{1, Set:new{2, 3}, 4}
+--      > a = Set{1, Set{2, 3}, 4}
 --      > b = a:power()
---      > b:flatten()
+--      > b:flattened()
 --      {1, 2, 3, 4}
-function Set:flatten ()
+function Set:flattened ()
+    local isset = isset
     local res = Set:new()
-    for v in self:members() do
-        if is_set(v) then
-            res = res + v:flatten()
+    local add = res.add
+    local s = {}
+    local q = self:totable()
+    local l = #q
+    local n = 0
+    while n <= l do
+        n = n + 1
+        if isset(q[n]) then
+            if not s[q[n]] then
+                s[q[n]] = true
+                local t = q[n]:totable()
+                for i = 1, #t do
+                    l = l + 1
+                    q[l] = t[i]
+                end
+            end
         else
-            res:add{v}
+            add(res, {q[n]})
         end
     end
     return res
 end
 
 
---- Returns the members of the set sorted.
+--- Makes a set immutable.
 --
--- Keep in mind, sets may be multidimensional. Consider using `flatten`.
---
--- @tparam[opt] function callable A sorting function.
---
--- @treturn table A list of the members of the given set, sorted.
+-- @treturn FrozenSet The frozen set.
 --
 -- @usage
---      > a = Set:new{1, 3, 5, 2, 4, 6, 8, 10, 5, 9, 7}
---      > r = a:sorted()
---      > table.concat(r, ', ')
---      1, 2, 3, 4, 5, 6, 7, 8, 9, 10
-function Set:sorted (callable)
-    local t = self:totable()
-    table.sort(t, callable)
-    return t
+--      > a = Set()
+--      > a:add{0}
+--      > a
+--      {0}
+--      > a:freeze()
+--      {0}
+--      > a:add{1}
+--      set is frozen.
+--      [...]
+function Set:freeze ()
+    return setmetatable(self, FrozenSet.mt)
 end
 
 
---- Concatenates all members of the set to a string.
+--- Does nothing.
 --
--- Keep in mind, sets may be multidimensional. Consider using `flatten`.
---
--- @tparam[opt=''] string sep A string to seperate members.
---
--- @treturn string The members of the set, seperated by `sep`.
+-- @treturn Set The set.
 --
 -- @usage
---      > a = Set:new{1, 2, 3}
---      > a:concat(', ')
---      1, 2, 3
-function Set:concat (sep)
-    return table.concat(self:totable(), sep)
+--      > a = Set()
+--      > a:unfreeze()
+--      {}
+function Set:unfreeze ()
+    return self
 end
 
 
---- Unpacks the members of the set.
+--- Blocks accidential modifications of a set or its members.
 --
--- @return The members of the given set unpacked.
---
--- @usage
---      > a = Set:new{1, 2, 3}
---      > a:unpack()
---      1       2       3
-function Set:unpack ()
-    return table.unpack(self:totable())
+-- @raise An error whenever it's invoked.
+function Set.mt:__newindex ()
+    error(SETMODERR, 2)
 end
 
 
---- Copies a set.
+--- Easier access to new in derived prototypes.
 --
--- Copies are deep.
+-- @tparam[opt] table elems Members for the new set.
 --
--- You should *never* need this function.
+-- @return An instance of the given prototype for sets,
+--  populated with `elems`, if any were given.
+function Set.mt:__call (elems)
+    return self:new(elems)
+end
+
+
+--- The number of elements in the set.
 --
--- Instead of:
---
---      a = Set:new{1, 2, 3}
---      b = a:copy()
---      b:add{4}
---
--- Write:
---
---      a = Set:new{1, 2, 3}
---      b = a + Set:new{4}
---
--- @tparam Set set A set.
---
--- @return The same set, but a different instance.
+-- @treturn number Number of elements in the set.
 --
 -- @usage
---      > a = Set:new{1, 2, 3}
---      > r = a:copy()
---      > r
+--      > a = Set{1, 2, 3}
+--      > #a
+--      3
+function Set.mt:__len ()
+    -- @todo maybe counting as needed is faster than keeping track.
+    return self._val.len + #self._tab
+end
+
+
+--- Iterates over the set as if it were a list.
+--
+-- @usage
+--      > a = Set{'a', 'b', 'c'}
+--      > for i, v in ipairs(a) do print(i, v) end
+--      1       a
+--      2       b
+--      3       c
+function Set.mt:__ipairs ()
+    local vs = self._val.mem
+    local ts = self._tab
+    local n = #ts
+    local k = nil
+    local i = 0
+    local j = 0
+    return function ()
+        j = j + 1
+        if k ~= nil or i == 0 then
+            k, _ = next(vs, k)
+            if k ~= nil then return j, k end
+        end
+        if i < n then
+            i = i + 1
+            return j, ts[i]
+        end
+    end
+end
+
+
+--- Iterates over the set as if it were a table.
+--
+-- @usage
+--      > a = Set{'a', 'b', 'c'}
+--      > for k, v in pairs(a) do print(k, v) end
+--      1       a
+--      2       b
+--      3       c
+Set.mt.__pairs = Set.mt.__ipairs
+
+
+--- Tests whether the set is a subset of another set.
+--
+-- @tparam Set other The other set.
+--
+-- @treturn boolean Whether the set is a subset of another set.
+--
+-- @raise Raises an error of `other` is not a `Set`
+--  (or another implementation of its protocol).
+--
+-- @usage
+--      > a = Set{1, 2}
+--      > b = Set{1}
+--      > c = Set{3}
+--      > b <= a
+--      true
+--      > c <= a
+--      false
+function Set.mt:__le (other, s)
+    assert(isset(other))
+    local has = other.has
+    for i in self:mems() do
+        if not has(other, i, s) then return false end
+    end
+    return true
+end
+
+
+--- Tests whether the set is a strict subset of another set.
+--
+-- @tparam Set other The other set.
+--
+-- @treturn boolean Whether the set is a strict subset of another set.
+--
+-- @raise Raises an error of `other` is not a `Set`
+--  (or another implementation of its protocol).
+--
+-- @usage
+--      > a = Set{1, 2}
+--      > b = Set{1}
+--      > c = Set{3}
+--      > a < a
+--      false
+--      > a <= a
+--      true
+--      > b < a
+--      true
+--      > c < a
+--      false
+function Set.mt:__lt (other)
+    assert(isset(other))
+    if #self < #other then return self <= other end
+    return false
+end
+
+
+--- Tests whether the set is equal to another set.
+--
+-- @tparam Set other The other set.
+--
+-- @treturn boolean Whether the set is equal to another set.
+--
+-- @raise Raises an error of `other` is not a `Set`
+--  (or another implementation of its protocol).
+--
+-- @usage
+--      > a = Set{1}
+--      > b = Set{1}
+--      > c = Set{2}
+--      > a == b
+--      true
+--      > a ~= b
+--      false
+--      > a == c
+--      false
+--      > a ~= c
+--      true
+function Set.mt:__eq (other, s)
+    if not isset(other) or not isset(self) then return false end
+    if #self ~= #other then return false end 
+    return getmetatable(self).__le(self, other, s)
+end
+
+
+--- The union of the set and another set.
+--
+-- `union(a, b)` and `a + b` are equivalent.
+--
+-- @tparam Set other The other set.
+--
+-- @treturn Set The union of the two sets.
+--
+-- @raise Raises an error of `other` is not a `Set`
+--  (or another implementation of its protocol).
+--
+-- @usage
+--      > a = Set{1}
+--      > b = Set{2}
+--      > a + b
+--      {1, 2}
+function Set.mt:__add (other)
+    return union{self, other}
+end
+
+
+--- The complement of the set and another set.
+--
+-- `complement(a, b)` and `a - b` are equivalent.
+--
+-- @tparam Set other The other set.
+--
+-- @treturn Set The complement of the two sets.
+--
+-- @raise Raises an error of `other` is not a `Set`
+--  (or another implementation of its protocol).
+--
+-- @usage
+--      > a = Set{1, 2}
+--      > b = Set{2}
+--      > a - b
+--      {1}
+function Set.mt:__sub (other)
+    return complement(self, other)
+end
+
+
+--- The intersection of the set and another set.
+--
+-- `intersection(a, b)` and `a ^ b` are equivalent.
+--
+-- @tparam Set other The other set.
+--
+-- @treturn Set The intersection of the two sets.
+--
+-- @raise Raises an error of `other` is not a `Set`
+--  (or another implementation of its protocol).
+--
+-- @usage
+--      > a = Set{1, 2}
+--      > b = Set{2, 3}
+--      > a ^ b
+--      {3}
+function Set.mt:__pow (other)
+    return intersection(self, other)
+end
+
+
+--- A string representation of the set.
+--
+-- @treturn string A string that represents the set.
+--
+-- @usage
+--      > a = Set{1, Set{2, 3}, 4}
+--      > tostring(a)
+--      {1, {2, 3}, 4}
+function Set.mt:__tostring (s)
+    local tostring = tostring
+    local isset = isset
+    local s = s or {}
+    local t = {}
+    local n = 0
+    for v in self:mems() do
+        n = n + 1
+        if isset(v) then
+            if not s[v] then
+                s[v] = true
+                t[n] = getmetatable(v).__tostring(v, s)
+            else
+                return string.format('(cycle: 0x%x)', v:id(ASNUM))
+            end
+        else
+            t[n] = tostring(v)
+        end
+    end
+    return table.concat({'{', '}'}, table.concat(t, ', '))
+end
+
+
+---
+-- Frozen Sets are just sets whose `add`, `remove`, and `clear` methods raise
+-- an error. They can be populated when they are created but cannot be changed
+-- thereafter (through their interface at any rate). The prototype of
+-- `FrozenSet` is `Set`, so, otherwise, they behave in the same way as Sets.
+--
+-- @type FrozenSet
+FrozenSet = {}
+FrozenSet.mt = {}
+-- That I have to do this is a design flaw in Lua.
+for k, v in pairs(Set.mt) do FrozenSet.mt[k] = v end
+FrozenSet.mt.__index = FrozenSet
+
+
+--- Creates a new instance of a set prototype, typically `FrozenSet`.
+--
+-- Note: You cannot create instances of `FrozenSet` using `Set.new`.
+--
+-- @tparam[opt] table elems Members for the new set.
+--
+-- @return An instance of the given `prototype` for sets,
+--  populated with `members`, if any were given.
+--
+-- @usage
+--      > FrozenSet:new{1, 2, 3}
 --      {1, 2, 3}
---      > a:add{4}
---      > r
+--      > FrozenSet{1, 2, 3}
 --      {1, 2, 3}
-function Set:copy ()
-    local res = Set:new()
-    res._members = copy(self._members)
-    return res
+function FrozenSet:new (elems)
+    self = self or FrozenSet
+    local set = Set:new(elems)
+    return setmetatable(set, self.mt)
 end
 
 
---- n-ary set arithmetics
+--- Tests whether the set is frozen.
 --
+-- @treturn boolean `true`.
+--
+-- @usage
+--      > a = FrozenSet()
+--      > a:isfrozen()
+--      true
+function FrozenSet:isfrozen ()
+    return true
+end
+
+
+---
+-- Blocks accidential modifications of a set or its members.
+--
+-- @raise An error whenever it's invoked.
+function FrozenSet.add ()
+    error(MODFROZENERR, 2)
+end
+
+
+---
+-- Blocks accidential modifications of a set or its members.
+--
+-- @raise An error whenever it's invoked.
+function FrozenSet.remove ()
+    error(MODFROZENERR, 2)
+end
+
+
+---
+-- Blocks accidential modifications of a set or its members.
+--
+-- @raise An error whenever it's invoked.
+function FrozenSet.clear ()
+    error(MODFROZENERR, 2)
+end
+
+
+--- Does nothing.
+--
+-- @treturn FrozenSet The frozen set.
+--
+-- @usage
+--      > a = FrozenSet()
+--      > a:freeze()
+--      {}
+function FrozenSet:freeze ()
+    return self
+end
+
+
+--- Make the set mutable.
+--
+-- @treturn Set The unfrozen set.
+--
+-- @usage
+--      > a = FrozenSet()
+--      > a:add{0}
+--      set is frozen.
+--      [...]
+--      > a:unfreeze()
+--      {}
+--      > a:add{0}
+--      > a
+--      {0}
+function FrozenSet:unfreeze ()
+    return setmetatable(self, Set.mt)
+end
+
+
+-- This must be done after the functions have been added.
+-- Once `Set` is the metatable of `FrozenSet`,
+-- its members can no longer be changed.
+setmetatable(FrozenSet, Set.mt)
+
+
+--- Set arithmetics
 -- @section arithmetics
 
 --- Tests whether two or more sets are disjoint.
@@ -799,18 +1024,19 @@ end
 -- @treturn boolean Whether the given sets are disjoint.
 --
 -- @usage
---      > a = Set:new{1}
---      > b = Set:new{1, 2}
---      > c = Set:new{2}
---      > d = Set:new{3}
---      > properset.are_disjoint{a, b, c}
+--      > a = Set{1}
+--      > b = Set{1, 2}
+--      > c = Set{2}
+--      > d = Set{3}
+--      > properset.aredisjoint{a, b, c}
 --      false
---      > properset.are_disjoint{a, c, d}
+--      > properset.aredisjoint{a, c, d}
 --      true
-function are_disjoint (sets)
+function aredisjoint (sets)
+    local int = intersection
     for i = 1, #sets do
         for j = i + 1, #sets do
-            local s = intersection{sets[i], sets[j]}
+            local s = int{sets[i], sets[j]}
             if #s ~= 0 then return false end
         end
     end
@@ -828,14 +1054,21 @@ end
 -- @treturn Set The complement of A and B.
 --
 -- @usage
---      > a = Set:new{1, 2}
---      > b = Set:new{2}
+--      > a = Set{1, 2}
+--      > b = Set{2}
 --      > properset.complement(a, b)
 --      {1}
 function complement (a, b)
+    -- @todo make n-ary; perhaps as in Python?
+    assert(isset(a))
+    assert(isset(b))
+    local has = b.has
+    local uad = unchkdadd
     local res = Set:new()
-    for i in a:members() do
-        if not b:has_member(i) then res:add{i} end
+    local n = 1
+    for v in a:mems() do
+        -- @todo Test if it's faster without passing n around.
+        if not has(b, v) then n = uad(res, v, n) end
     end
     return res
 end
@@ -850,14 +1083,20 @@ end
 -- @treturn Set The union of the given sets.
 --
 -- @usage
---      > a = Set:new{1}
---      > b = Set:new{2}
---      > c = Set:new{3}
+--      > a = Set{1}
+--      > b = Set{2}
+--      > c = Set{3}
 --      > properset.union{a, b, c}
 --      {1, 2, 3}
 function union (sets)
-    local res = sets[1]:copy()
-    for i = 2, #sets do res:add(sets[i]._members) end
+    local ass = function (x) assert(isset(x)) end 
+    local add = Set.add
+    local res = Set:new()
+    local n = #sets
+    for i = 1, n do
+        ass(sets[i])
+        add(res, sets[i])
+    end
     return res
 end
 
@@ -869,26 +1108,33 @@ end
 -- @treturn Set The intersection of the given sets.
 --
 -- @usage
---      > a = Set:new{1}
---      > b = Set:new{1,2}
---      > c = Set:new{2}
---      > d = Set:new{1,3}
+--      > a = Set{1}
+--      > b = Set{1,2}
+--      > c = Set{2}
+--      > d = Set{1,3}
 --      > properset.intersection{a, b, c}
 --      {}
 --      > properset.intersection{a, b, d}
 --      {1}
 function intersection (sets)
-    if #sets == 1 then
+    local ass = function (x) assert(isset(x)) end
+    local n = #sets
+    if n == 1 then
         return sets[1]
-    elseif #sets > 1 then
-        local res = sets[1]:copy()
-        for i = 2, #sets do
-            for j = #res._members, 1, -1 do
-                if not sets[i]:has_member(res._members[j]) then
-                    table.remove(res._members, j)
-                end
+    elseif n > 1 then
+        ass(sets[1], "arg " .. 1)
+        local add = Set.add
+        local res
+        local acc = sets[1]
+        for i = 2, n do
+            ass(sets[i])
+            res = Set:new()
+            for v in acc:mems() do
+                -- @todo Check if properset.add would work.
+                if sets[i]:has(v) then add(res, {v}) end
+                acc = res
             end
-            if res:is_empty() then break end
+            if #acc == 0 then break end
         end
         return res
     end
@@ -909,101 +1155,65 @@ end
 -- @treturn Set The symmetric difference of the given sets.
 --
 -- @usage
---      > a = Set:new{1, 2}
---      > b = Set:new{1, 3}
---      > c = Set:new{1, 2, 3, 4}
+--      > a = Set{1, 2}
+--      > b = Set{1, 3}
+--      > c = Set{1, 2, 3, 4}
 --      > properset.difference{a, b, c}
 --      {1, 4}
 function difference (sets)
-    local res = sets[1]:copy()
-    for i = 2, #sets do
-        res = complement(union{res, sets[i]}, intersection{res, sets[i]})
+    local ass = function (x) assert(isset(x)) end
+    local com = complement
+    local uni = union
+    local int = intersection
+    local res = Set:new()
+    for i = 1, #sets do
+        ass(sets[i])
+        res = com(uni{res, sets[i]}, int{res, sets[i]})
     end
     return res
-end
-
-
---- Iterating over sets
---
--- @section iteration
-
---- Iterates over sets as if they were lists.
---
--- Unless you're building something fancy,
--- you'll want to use `Set:__ipairs` instead.
---
--- @tparam Set set The set to iterate over.
--- @tparam number i The current index.
---
--- @usage
---      > a = Set:new{'a', 'b', 'c'}
---      > for i, v in properset.nth_member, a, 0 do print(i, v) end
---      1       a
---      2       b
---      3       c
-function nth_member(set, i)
-    i = i + 1
-    local v = set._members[i]
-    if v then return i, v end
-end
-
-
---- Iterates over sets as if they were tables.
---
--- Unless you're building something fancy,
--- you'll want to use `Set:__pairs` instead.
---
--- @tparam Set set The set to iterate over.
--- @tparam number k The current index.
---
--- @usage
---      > a = Set:new{'a', 'b', 'c'}
---      > for k, v in properset.next_member, a, nil do print(i, v) end
---      nil       a
---      nil       b
---      nil       c
-function next_member(set, k)
-    k, v = next(set._members, k)
-    if v then return k, v end
 end
 
 
 --- Utility functions
 -- @section function
 
---- Tests whether an object behaves Set-ish.
+--- Tests whether an object behaves like a Set.
+--
+-- That is, tests:
+--
+-- 1. whether an object's metatable has all fields defined in `Set.mt`;
+-- 2. whether an object has all fields defined in `Set`.
+--
+-- Note: Does *not* test whether those fields refer to functions.
+--
+-- An object whose metatable provides all methods defined in `Set.mt`
+-- and that itself provides all methods defined in `Set` is said to
+-- implement the "Set protocol".
 --
 -- @param obj An object.
 --
--- @treturn boolean Whether `obj` implements the `Set` protocol.
+-- @treturn boolean Whether `obj` implements the Set protocol.
+-- @treturn string If it doesn't implement the Set protocol, an error message.
 --
 -- @usage
---      > a = Set:new()
---      > properset.is_set(a)
+--      > a = Set()
+--      > properset.isset(a)
 --      true
 --      > b = "I may be many things, but a Set I'm not."
---      > properset.is_set(b)
---      false
-function is_set (obj)
-    if type(obj) == 'table' then
-        for k, v in pairs(Set) do
-            if obj[k] == nil then return false end
-        end
+--      > properset.isset(b)
+--      false     expected a Set, got a string.
+function isset (obj)
+    local rawequal = rawequal
+    local t = type(obj)
+    if t == 'table' then
+        local mt = getmetatable(obj)
+        if mt == nil then return false end
+        for k in pairs(Set.mt) do if mt[k] == nil then return false end end
+        local req = rawequal
+        for k in pairs(Set) do if req(obj[k], nil) then return false end end
         return true
     end
-    return false
-end
-
-
---- Asserts that an object is a set.
---
--- @param obj An object.
--- @param[opt] errmsg An error message.
---
--- @raise An error if `obj` isn't a `Set` (or implements the Set protocol).
-function assert_set (obj, errmsg)
-    errmsg = errmsg or 'expected a Set, but got a ' .. type(obj)
-    assert(is_set(obj), errmsg)
+    return false, string.format(NOTASETERR, t)
 end
 
 
@@ -1024,18 +1234,23 @@ end
 --      > s = "I'm nobody."
 --      > properset.rank(s)
 --      0
---      > a = Set:new()
+--      > a = Set()
 --      > properset.rank(a)
 --      1
---      > b = Set:new{Set:new{Set:new{Set:new{}}, Set:new{}, 1}, 2}
+--      > b = Set{Set{Set{Set{}}, Set{}, 1}, 2}
 --      > properset.rank(b)
 --      4
-function rank (obj)
-    if not is_set(obj) then return 0 end
+function rank (obj, s)
+    local isset = isset
+    if not isset(obj) then return 0 end
+    s = s or {}
+    local rank = rank
     local res = 1
-    for v in obj:members() do
-        if is_set(v) then
-            r = rank(v) + 1
+    for v in obj:mems() do
+        if isset(v) then
+            if s[v] then return huge end
+            s[v] = true
+            local r = rank(v, s) + 1
             if r > res then res = r end
         end
     end
@@ -1043,27 +1258,11 @@ function rank (obj)
 end
 
 
---- Shorthand for creating sets.
---
--- Typing `Set:new{}` becomes tiresome quickly.
--- Hence this shorthand.
---
--- @tparam[opt] table members Objects.
---
--- @treturn Set A set, populated with `members`, if any were given.
---
--- @usage
---      > set = betterset.set
---      > a = set{1, 2, 3}
-function set (members)
-    return Set:new(members)
-end
-
-
 --- Copies a table recursively.
 --
--- Handles metatables, recursive structures, tables as keys, metatables,
--- avoids the `__pairs` metemethod, and can handle instances of `Set`.
+-- Handles metatables, recursive structures, tables as keys, and
+-- avoids the `__pairs` and `__newindex` metamethods.
+-- Copies are deep.
 --
 -- @param obj Object or value of an arbitrary type.
 --
@@ -1076,28 +1275,50 @@ end
 --      > table.insert(a, 4)
 --      > table.unpack(r[1])
 --      1       2       3
-function copy(obj, seen)
+function copy (obj, s)
     -- Borrows from:
     -- * <https://gist.github.com/tylerneylon/81333721109155b2d244>
     -- * <http://lua-users.org/wiki/CopyTable>
     if type(obj) ~= 'table' then return obj end
-    if is_set(obj) then return obj:copy(true) end
-    if seen and seen[obj] then return seen[obj] end
+    if s and s[obj] then return s[obj] end
+    local copy = copy
     local res = setmetatable({}, getmetatable(obj))
-    seen = seen or {}
-    seen[obj] = res
+    s = s or {}
+    s[obj] = res
     for k, v in next, obj, nil do
-        res[copy(k, seen)] = copy(v, seen)
+        rawset(res, copy(k, s), copy(v, s))
     end
     return res
 end
 
 
---- Useful constants
+--- Constants 
 -- @section constants
 
 --- The empty set.
--- @field emptyset The empty set (`Set:new{}`).
-emptyset = Set:new()
+--
+-- @field emptyset The empty set (`FrozenSet:new()`).
+emptyset = FrozenSet:new()
+
+
+--- If this flag is passed to a method that understands it,
+-- sets are processed recursively.
+--
+-- Currently used by:
+--
+--  * `Set:ofrank`
+--  * `Set:totable`
+--  * `Set:unpack`
+--  * `Set:sorted`
+RECURSIVE = 1
+
+--- If this flag is passed to `Set:id`, the set's ID is returned as a number.
+--
+-- Only used by `Set:id`.
+ASNUM = 1
+
+
+-- Backplate
+-- =========
 
 return properset
